@@ -1,0 +1,45 @@
+{
+  "tahoe": {
+    "Algorithm": "TCP Tahoe",
+    "Avg cwnd (pkts)": "50.68",
+    "Max cwnd (pkts)": "64.3",
+    "Min cwnd (pkts)": "2.0",
+    "Std cwnd": "6.35",
+    "Avg RTT (ms)": "380.1",
+    "Max RTT (ms)": "452.4",
+    "Avg Drop Rate (%)": "7.26",
+    "Overall Drop Rate (%)": "6.99",
+    "Avg Throughput (kbps)": "1406.0",
+    "Max Throughput (kbps)": "1663.8",
+    "Total Packets Sent": "30000",
+    "Total Packets Dropped": "2096",
+    "Total Packets ACKed": "27904"
+  },
+  "reno": {
+    "Algorithm": "TCP Reno",
+    "Avg cwnd (pkts)": "55.32",
+    "Max cwnd (pkts)": "67.2",
+    "Min cwnd (pkts)": "2.0",
+    "Std cwnd": "6.50",
+    "Avg RTT (ms)": "397.8",
+    "Max RTT (ms)": "453.3",
+    "Avg Drop Rate (%)": "8.13",
+    "Overall Drop Rate (%)": "8.15",
+    "Avg Throughput (kbps)": "1539.9",
+    "Max Throughput (kbps)": "1644.7",
+    "Total Packets Sent": "30000",
+    "Total Packets Dropped": "2444",
+    "Total Packets ACKed": "27556"
+  },
+  "network_params": {
+    "sender_to_router_bw_mbps": 10.0,
+    "router_to_receiver_bw_mbps": 1.5,
+    "sender_to_router_delay_ms": 5.0,
+    "router_to_receiver_delay_ms": 20.0,
+    "packet_size_bytes": 1500,
+    "router_queue_size": 20,
+    "base_rtt_ms": 50.0,
+    "bdp_packets": 6,
+    "total_ack_events": 6000
+  }
+}
