@@ -72,7 +72,7 @@ python tcp_simulation.py
 
 Output graphs and statistics are saved in the `output/` directory. Works on Windows, macOS, and Linux.
 
-## Team Members
+## Author
 
 | Name |
 |------|
