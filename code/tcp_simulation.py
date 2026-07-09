@@ -61,8 +61,9 @@ BOTTLENECK_BDP = max(int(ROUTER_TO_RECEIVER_BW * BASE_RTT / (PACKET_SIZE * 8)), 
 TOTAL_ACK_EVENTS = 6000  # Total ACK events to simulate
 INITIAL_CWND = 1.0
 INITIAL_SSTHRESH = 64.0
-LOSS_THRESHOLD_CWND = BOTTLENECK_BDP + 4  # Loss starts when cwnd > BDP + buffer margin
-BASE_LOSS_PROB = 0.008  # Base probability of loss per ACK when cwnd > threshold
+# Loss begins when cwnd exceeds BDP + router queue capacity (queue overflow)
+LOSS_THRESHOLD_CWND = BOTTLENECK_BDP + ROUTER_QUEUE_SIZE  # 6 + 20 = 26 packets
+BASE_LOSS_PROB = 0.04  # Base probability of loss per ACK when cwnd > threshold
 SEED = 42
 
 
@@ -77,10 +78,8 @@ def simulate_tahoe(seed=SEED):
     - Slow Start: cwnd += 1 per ACK (exponential growth) while cwnd < ssthresh
     - Congestion Avoidance: cwnd += 1/cwnd per ACK (linear) while cwnd >= ssthresh
     - On 3 duplicate ACKs: ssthresh = cwnd/2, cwnd = 1 (reset to slow start)
-    - On timeout: ssthresh = cwnd/2, cwnd = 1 (reset to slow start)
     """
     rng = random.Random(seed)
-    np_rng = np.random.RandomState(seed)
 
     cwnd = INITIAL_CWND
     ssthresh = INITIAL_SSTHRESH
@@ -93,11 +92,12 @@ def simulate_tahoe(seed=SEED):
     current_time = 0.0
     srtt = BASE_RTT
     rttvar = BASE_RTT / 2
-    last_loss_cwnd = []
 
     for ack_event in range(TOTAL_ACK_EVENTS):
         # --- Determine if this ACK is a duplicate or new ---
-        # Loss probability increases as cwnd exceeds the BDP
+        # Loss probability increases with cwnd beyond threshold.
+        # When congestion occurs, losses happen in bursts (queue overflow
+        # drops multiple packets), so we model burst loss probability.
         if cwnd > LOSS_THRESHOLD_CWND:
             excess = (cwnd - LOSS_THRESHOLD_CWND) / LOSS_THRESHOLD_CWND
             loss_prob = BASE_LOSS_PROB * (1 + 2.0 * excess)
@@ -112,16 +112,13 @@ def simulate_tahoe(seed=SEED):
 
             if dup_ack_count == 3:
                 # Tahoe: triple-dup-ACK -> ssthresh = cwnd/2, cwnd = 1
-                last_loss_cwnd.append(cwnd)
                 ssthresh = max(cwnd / 2.0, 2.0)
                 cwnd = 1.0
                 dup_ack_count = 0
         else:
-            # New ACK received
-            if dup_ack_count >= 3:
-                # Already handled above, this shouldn't happen in Tahoe
-                pass
-            dup_ack_count = 0
+            # New ACK received — decay dup counter (don't hard-reset to 0
+            # because in real TCP, out-of-order arrivals sustain dup ACKs)
+            dup_ack_count = max(0, dup_ack_count - 1)
             total_acked += 1
             bytes_sent += PACKET_SIZE
 
@@ -147,7 +144,8 @@ def simulate_tahoe(seed=SEED):
         srtt = (1 - alpha) * srtt + alpha * measured_rtt
 
         # Time advancement: each ACK represents a fraction of an RTT
-        ack_spacing = srtt / max(cwnd, 1)
+        min_spacing = (PACKET_SIZE * 8) / ROUTER_TO_RECEIVER_BW  # bottleneck transmission time per packet
+        ack_spacing = max(srtt / max(cwnd, 1), min_spacing)
         current_time += ack_spacing
 
         # --- Log metrics ---
@@ -180,10 +178,8 @@ def simulate_reno(seed=SEED):
     - On 3 duplicate ACKs: ssthresh = cwnd/2, cwnd = ssthresh + 3 (fast recovery)
       - During fast recovery: cwnd += 1 per additional dup ACK
       - On new ACK exiting recovery: cwnd = ssthresh (enter congestion avoidance)
-    - On timeout: ssthresh = cwnd/2, cwnd = 1 (same as Tahoe)
     """
     rng = random.Random(seed + 1000)
-    np_rng = np.random.RandomState(seed + 1000)
 
     cwnd = INITIAL_CWND
     ssthresh = INITIAL_SSTHRESH
@@ -200,6 +196,8 @@ def simulate_reno(seed=SEED):
 
     for ack_event in range(TOTAL_ACK_EVENTS):
         # Loss probability (same model as Tahoe for fair comparison)
+        # Burst loss model: when congestion occurs, multiple packets drop
+        # in sequence, generating dup ACKs without full counter reset.
         if cwnd > LOSS_THRESHOLD_CWND:
             excess = (cwnd - LOSS_THRESHOLD_CWND) / LOSS_THRESHOLD_CWND
             loss_prob = BASE_LOSS_PROB * (1 + 2.0 * excess)
@@ -237,7 +235,8 @@ def simulate_reno(seed=SEED):
                     in_fast_recovery = True
                     dup_ack_count = 0  # Reset for recovery phase
             else:
-                dup_ack_count = 0
+                # Decay dup counter (same as Tahoe: don't hard-reset)
+                dup_ack_count = max(0, dup_ack_count - 1)
                 total_acked += 1
                 bytes_sent += PACKET_SIZE
 
@@ -260,7 +259,8 @@ def simulate_reno(seed=SEED):
         rttvar = (1 - beta) * rttvar + beta * abs(srtt - measured_rtt)
         srtt = (1 - alpha) * srtt + alpha * measured_rtt
 
-        ack_spacing = srtt / max(cwnd, 1)
+        min_spacing = (PACKET_SIZE * 8) / ROUTER_TO_RECEIVER_BW  # bottleneck transmission time per packet
+        ack_spacing = max(srtt / max(cwnd, 1), min_spacing)
         current_time += ack_spacing
 
         # Log
@@ -309,8 +309,13 @@ def run_multi_sim(sim_func, num_runs=5, seed_base=42):
 # =============================================================================
 # Graph Generation
 # =============================================================================
-def generate_graphs(tahoe_data, reno_data, output_dir):
-    """Generate all comparison graphs with clean, publication-quality layout."""
+def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
+    """Generate all comparison graphs with clean, publication-quality layout.
+
+    cwnd and RTT plots use single-run data to preserve sharp sawtooth patterns
+    (multi-run averaging smears Tahoe's cwnd=1 resets into shallow dips).
+    Drop rate and throughput plots use 5-run averaged data for stability.
+    """
     print("\nGenerating comparison graphs...")
 
     # ---- Shared style constants ----
@@ -348,21 +353,20 @@ def generate_graphs(tahoe_data, reno_data, output_dir):
         return leg
 
     # =================================================================
-    # Graph 1: Congestion Window
+    # Graph 1: Congestion Window (single run — preserves sharp cwnd=1 resets)
     # =================================================================
     fig, ax = plt.subplots(figsize=(11, 5.2))
     fig.patch.set_facecolor('white')
 
-    ax.plot(tahoe_data['time'], tahoe_data['cwnd'],
+    ax.plot(tahoe_single['time'], tahoe_single['cwnd'],
             color=TAHOE_COLOR, linewidth=1.3, label='TCP Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['cwnd'],
+    ax.plot(reno_single['time'], reno_single['cwnd'],
             color=RENO_COLOR, linewidth=1.3, label='TCP Reno', zorder=3)
 
-    # Reference line: BDP — subtle, with label on the RIGHT edge
+    # Reference line: BDP
     ax.axhline(y=BOTTLENECK_BDP, color=REF_COLOR, linestyle='--',
                linewidth=1.0, alpha=0.7, zorder=1)
-    ax.text(ax.get_xlim()[1] if ax.get_xlim()[1] > 0 else tahoe_data['time'][-1],
-            BOTTLENECK_BDP + 1.2, f'BDP = {BOTTLENECK_BDP} pkts',
+    ax.text(0.98, 0.05, f'BDP = {BOTTLENECK_BDP} pkts', transform=ax.transAxes,
             fontsize=8.5, color='#757575', ha='right', va='bottom', style='italic')
 
     _style_ax(ax, 'Time (seconds)', 'Congestion Window (packets)',
@@ -377,28 +381,28 @@ def generate_graphs(tahoe_data, reno_data, output_dir):
     print("  Saved: cwnd_comparison.png")
 
     # =================================================================
-    # Graph 2: RTT
+    # Graph 2: RTT (single run — preserves sharp sawtooth correlation with cwnd)
     # =================================================================
     fig, ax = plt.subplots(figsize=(11, 5.2))
     fig.patch.set_facecolor('white')
 
-    ax.plot(tahoe_data['time'], tahoe_data['rtt'],
+    ax.plot(tahoe_single['time'], tahoe_single['rtt'],
             color=TAHOE_COLOR, linewidth=1.2, label='TCP Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['rtt'],
+    ax.plot(reno_single['time'], reno_single['rtt'],
             color=RENO_COLOR, linewidth=1.2, label='TCP Reno', zorder=3)
 
     # Reference line: Base RTT
     ax.axhline(y=BASE_RTT * 1000, color=REF_COLOR, linestyle='--',
                linewidth=1.0, alpha=0.7, zorder=1)
-    ax.text(ax.get_xlim()[1] if ax.get_xlim()[1] > 0 else tahoe_data['time'][-1],
-            BASE_RTT * 1000 + 5,
-            f'Base RTT = {BASE_RTT*1000:.0f} ms',
+    # Place annotation in lower-right corner (empty space, data lines are ~440ms)
+    ax.text(0.98, 0.05, f'Base RTT = {BASE_RTT*1000:.0f} ms',
+            transform=ax.transAxes,
             fontsize=8.5, color='#757575', ha='right', va='bottom', style='italic')
 
     _style_ax(ax, 'Time (seconds)', 'Round-Trip Time (ms)',
               'Round-Trip Time Variations: TCP Tahoe vs Reno')
     ax.set_xlim(left=0)
-    _clean_legend(ax, loc='upper right')
+    _clean_legend(ax, loc='upper left')
     plt.tight_layout(pad=1.5)
     plt.savefig(os.path.join(output_dir, 'rtt_comparison.png'), dpi=200,
                 bbox_inches='tight', facecolor='white')
@@ -406,14 +410,14 @@ def generate_graphs(tahoe_data, reno_data, output_dir):
     print("  Saved: rtt_comparison.png")
 
     # =================================================================
-    # Graph 3: Drop Rate
+    # Graph 3: Drop Rate (5-run average — smoothing is fine for cumulative metrics)
     # =================================================================
     fig, ax = plt.subplots(figsize=(11, 5.2))
     fig.patch.set_facecolor('white')
 
-    ax.plot(tahoe_data['time'], tahoe_data['drop_rate'],
+    ax.plot(tahoe_avg['time'], tahoe_avg['drop_rate'],
             color=TAHOE_COLOR, linewidth=1.4, label='TCP Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['drop_rate'],
+    ax.plot(reno_avg['time'], reno_avg['drop_rate'],
             color=RENO_COLOR, linewidth=1.4, label='TCP Reno', zorder=3)
 
     _style_ax(ax, 'Time (seconds)', 'Packet Drop Rate (%)',
@@ -428,22 +432,21 @@ def generate_graphs(tahoe_data, reno_data, output_dir):
     print("  Saved: drop_rate_comparison.png")
 
     # =================================================================
-    # Graph 4: Throughput
+    # Graph 4: Throughput (5-run average)
     # =================================================================
     fig, ax = plt.subplots(figsize=(11, 5.2))
     fig.patch.set_facecolor('white')
 
-    ax.plot(tahoe_data['time'], tahoe_data['throughput'],
+    ax.plot(tahoe_avg['time'], tahoe_avg['throughput'],
             color=TAHOE_COLOR, linewidth=1.4, label='TCP Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['throughput'],
+    ax.plot(reno_avg['time'], reno_avg['throughput'],
             color=RENO_COLOR, linewidth=1.4, label='TCP Reno', zorder=3)
 
     # Reference line: Bottleneck capacity
     ax.axhline(y=bottleneck_kbps, color=REF_COLOR, linestyle='--',
                linewidth=1.0, alpha=0.7, zorder=1)
-    ax.text(ax.get_xlim()[1] if ax.get_xlim()[1] > 0 else tahoe_data['time'][-1],
-            bottleneck_kbps + 20,
-            f'Bottleneck = {bottleneck_kbps:.0f} kbps',
+    ax.text(0.98, 0.05, f'Bottleneck = {bottleneck_kbps:.0f} kbps',
+            transform=ax.transAxes,
             fontsize=8.5, color='#757575', ha='right', va='bottom', style='italic')
 
     _style_ax(ax, 'Time (seconds)', 'Throughput (kbps)',
@@ -465,54 +468,54 @@ def generate_graphs(tahoe_data, reno_data, output_dir):
     fig.suptitle('TCP Tahoe vs Reno: Performance Dashboard',
                  fontsize=15, fontweight='bold', y=0.98)
 
-    # (a) cwnd
+    # (a) cwnd — single run for sharp sawtooth
     ax = axes[0, 0]
-    ax.plot(tahoe_data['time'], tahoe_data['cwnd'],
+    ax.plot(tahoe_single['time'], tahoe_single['cwnd'],
             color=TAHOE_COLOR, linewidth=1.1, label='Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['cwnd'],
+    ax.plot(reno_single['time'], reno_single['cwnd'],
             color=RENO_COLOR, linewidth=1.1, label='Reno', zorder=3)
     ax.axhline(y=BOTTLENECK_BDP, color=REF_COLOR, linestyle='--',
                linewidth=0.9, alpha=0.6, zorder=1)
-    ax.text(0.98, 0.92, f'BDP = {BOTTLENECK_BDP}', transform=ax.transAxes,
-            fontsize=7.5, color='#9E9E9E', ha='right', va='top', style='italic')
+    ax.text(0.98, 0.05, f'BDP = {BOTTLENECK_BDP}', transform=ax.transAxes,
+            fontsize=7.5, color='#9E9E9E', ha='right', va='bottom', style='italic')
     _style_ax(ax, 'Time (s)', 'cwnd (pkts)', '(a) Congestion Window')
     ax.set_xlim(left=0); ax.set_ylim(bottom=0)
     _clean_legend(ax)
 
-    # (b) RTT
+    # (b) RTT — single run for sharp correlation with cwnd
     ax = axes[0, 1]
-    ax.plot(tahoe_data['time'], tahoe_data['rtt'],
+    ax.plot(tahoe_single['time'], tahoe_single['rtt'],
             color=TAHOE_COLOR, linewidth=1.1, label='Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['rtt'],
+    ax.plot(reno_single['time'], reno_single['rtt'],
             color=RENO_COLOR, linewidth=1.1, label='Reno', zorder=3)
     ax.axhline(y=BASE_RTT * 1000, color=REF_COLOR, linestyle='--',
                linewidth=0.9, alpha=0.6, zorder=1)
-    ax.text(0.98, 0.92, f'Base RTT = {BASE_RTT*1000:.0f} ms', transform=ax.transAxes,
-            fontsize=7.5, color='#9E9E9E', ha='right', va='top', style='italic')
+    ax.text(0.98, 0.05, f'Base RTT = {BASE_RTT*1000:.0f} ms', transform=ax.transAxes,
+            fontsize=7.5, color='#9E9E9E', ha='right', va='bottom', style='italic')
     _style_ax(ax, 'Time (s)', 'RTT (ms)', '(b) Round-Trip Time')
     ax.set_xlim(left=0)
     _clean_legend(ax)
 
-    # (c) Drop Rate
+    # (c) Drop Rate — averaged for stability
     ax = axes[1, 0]
-    ax.plot(tahoe_data['time'], tahoe_data['drop_rate'],
+    ax.plot(tahoe_avg['time'], tahoe_avg['drop_rate'],
             color=TAHOE_COLOR, linewidth=1.1, label='Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['drop_rate'],
+    ax.plot(reno_avg['time'], reno_avg['drop_rate'],
             color=RENO_COLOR, linewidth=1.1, label='Reno', zorder=3)
     _style_ax(ax, 'Time (s)', 'Drop Rate (%)', '(c) Packet Drop Rate')
     ax.set_xlim(left=0); ax.set_ylim(bottom=0)
     _clean_legend(ax)
 
-    # (d) Throughput
+    # (d) Throughput — averaged for stability
     ax = axes[1, 1]
-    ax.plot(tahoe_data['time'], tahoe_data['throughput'],
+    ax.plot(tahoe_avg['time'], tahoe_avg['throughput'],
             color=TAHOE_COLOR, linewidth=1.1, label='Tahoe', zorder=3)
-    ax.plot(reno_data['time'], reno_data['throughput'],
+    ax.plot(reno_avg['time'], reno_avg['throughput'],
             color=RENO_COLOR, linewidth=1.1, label='Reno', zorder=3)
     ax.axhline(y=bottleneck_kbps, color=REF_COLOR, linestyle='--',
                linewidth=0.9, alpha=0.6, zorder=1)
-    ax.text(0.98, 0.92, f'Capacity = {bottleneck_kbps:.0f} kbps', transform=ax.transAxes,
-            fontsize=7.5, color='#9E9E9E', ha='right', va='top', style='italic')
+    ax.text(0.98, 0.05, f'Capacity = {bottleneck_kbps:.0f} kbps', transform=ax.transAxes,
+            fontsize=7.5, color='#9E9E9E', ha='right', va='bottom', style='italic')
     _style_ax(ax, 'Time (s)', 'Throughput (kbps)', '(d) Throughput')
     ax.set_xlim(left=0); ax.set_ylim(bottom=0)
     _clean_legend(ax)
@@ -582,7 +585,10 @@ def main():
     print(f"\n{'─'*65}")
     print("  Phase 3: Generating Comparison Graphs")
     print(f"{'─'*65}")
-    generate_graphs(tahoe_data, reno_data, output_dir)
+    # Single-run data for cwnd/RTT plots (preserves sharp sawtooth patterns)
+    tahoe_single = simulate_tahoe(seed=42)
+    reno_single = simulate_reno(seed=1042)
+    generate_graphs(tahoe_single, reno_single, tahoe_data, reno_data, output_dir)
 
     print(f"\n{'─'*65}")
     print("  Phase 4: Summary Statistics")

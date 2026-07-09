@@ -22,13 +22,14 @@ Sender ----[10 Mbps, 5 ms]----> Router ----[1.5 Mbps, 20 ms]----> Receiver
 | Packet Size | 1500 bytes |
 | Router Queue Capacity | 20 packets |
 | Bandwidth-Delay Product (BDP) | 6 packets |
+| Loss Threshold (BDP + Queue) | 26 packets |
 
 ## What We Did
 
 1. Designed a discrete-event simulation modeling a sender, a bottleneck router, and a receiver.
 2. Implemented TCP Tahoe congestion control (Slow Start, Congestion Avoidance, Fast Retransmit, timeout recovery).
 3. Implemented TCP Reno congestion control (same as Tahoe plus Fast Recovery with window inflation).
-4. Used a probabilistic loss model triggered when cwnd exceeds BDP, simulating queue overflow.
+4. Used a probabilistic loss model triggered when cwnd exceeds BDP + router queue capacity (26 packets), simulating queue overflow at the bottleneck router.
 5. Applied Jacobson/Karels RTT estimation for dynamic timeout calculation.
 6. Ran each algorithm 5 times with different random seeds and averaged the results.
 7. Generated publication-quality comparison graphs (cwnd, RTT, drop rate, throughput, dashboard).
@@ -46,21 +47,24 @@ Sender ----[10 Mbps, 5 ms]----> Router ----[1.5 Mbps, 20 ms]----> Receiver
 - **On 3 Duplicate ACKs**: Sets ssthresh = cwnd/2, sets cwnd = ssthresh + 3, enters **Fast Recovery** — cwnd inflates by +1 per additional dup ACK, and exits to Congestion Avoidance on a new ACK.
 - **On Timeout**: Falls back to Tahoe behavior (cwnd = 1, Slow Start).
 
-**Key difference**: Reno's Fast Recovery avoids the costly cwnd = 1 reset on single-packet losses, maintaining a higher average sending rate.
+**Key difference**: Reno's Fast Recovery avoids the costly cwnd = 1 reset on single-packet losses detected via triple duplicate ACKs, maintaining a higher average sending rate.
 
 ## Results Summary
 
 | Metric | TCP Tahoe | TCP Reno | Difference |
 |--------|-----------|----------|------------|
-| Average cwnd | 50.68 pkts | 55.32 pkts | +9.2% |
-| Average RTT | 380.1 ms | 397.8 ms | +4.7% |
-| Overall Drop Rate | 6.99% | 8.15% | +16.6% |
-| **Average Throughput** | **1,406.0 kbps** | **1,539.9 kbps** | **+9.5%** |
-| Packets Dropped | 2,096 / 30,000 | 2,444 / 30,000 | — |
+| Average cwnd | 40.06 pkts | 40.78 pkts | +1.8% |
+| Max cwnd | 64.2 pkts | 55.9 pkts | -12.9% |
+| cwnd Std Dev | 5.35 pkts | 4.32 pkts | -19.3% |
+| Average RTT | 318.9 ms | 326.8 ms | +2.5% |
+| Overall Drop Rate | 7.94% | 8.53% | +7.4% |
+| Average Throughput | 1,215.6 kbps | 1,356.0 kbps | +11.5% |
+| Max Throughput | 1,337.6 kbps | 1,368.5 kbps | +2.3% |
+| Packets Dropped | 2,383 / 30,000 | 2,559 / 30,000 | — |
 
 ## Conclusion
 
-TCP Reno outperforms TCP Tahoe by approximately **9.5% in average throughput** (1,539.9 kbps vs 1,406.0 kbps). This improvement is directly attributable to Reno's Fast Recovery mechanism, which avoids resetting the congestion window to 1 after single-packet losses detected via triple duplicate ACKs. While Reno shows a slightly higher drop rate (8.15% vs 6.99%) due to its more aggressive window probing, it compensates by spending far less time in the low-throughput Slow Start recovery phase. For wired networks where single-packet losses are the dominant congestion signal, TCP Reno is the superior choice.
+TCP Reno achieves approximately **11.5%** higher throughput than TCP Tahoe (1,356.0 kbps vs 1,215.6 kbps) due to its **Fast Recovery** mechanism, which avoids restarting from **cwnd = 1** after triple duplicate ACKs. This results in higher bottleneck utilization (**90.4% vs 81.0%**) and more stable **cwnd**, with only a slightly higher drop rate (**8.53% vs 7.94%**). These findings are consistent with networking literature showing that **Fast Recovery** improves throughput under packet-loss conditions.
 
 ## How to Run
 
