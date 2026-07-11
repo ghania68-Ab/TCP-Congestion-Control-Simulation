@@ -3,9 +3,10 @@
 TCP Congestion Control Simulation: Tahoe vs Reno
 ==================================================
 Simulates TCP Tahoe and TCP Reno congestion control algorithms
-over a simple wired network topology with a bottleneck link.
+over a simple wired network topology with a bottleneck link, using
+Mininet for topology definition.
 
-Topology:
+Topology (defined via Mininet Topo class):
     Sender ----[10 Mbps, 5ms]----> Router ----[1.5 Mbps, 20ms]----> Receiver
                                                         |
                                                    Bottleneck Link
@@ -18,6 +19,10 @@ This simulation uses a discrete-event approach where each time step represents
 an ACK event. The congestion window determines how many unACKed packets can be
 in flight, and loss events are triggered probabilistically when cwnd exceeds
 the network's bandwidth-delay product.
+
+Both 3-duplicate-ACK (Fast Retransmit / Fast Recovery) and RTO timeout
+loss detection paths are implemented, following RFC 2581 (Tahoe/Reno
+congestion avoidance) and RFC 6298 (RTO calculation).
 """
 
 import matplotlib
@@ -27,7 +32,135 @@ import matplotlib.font_manager as fm
 import numpy as np
 import random
 import json
+import csv
 import os
+
+# =============================================================================
+# Mininet Topology Definition
+# =============================================================================
+_MININET_AVAILABLE = False
+try:
+    from mininet.topo import Topo as _MininetTopo
+    from mininet.link import TCLink as _TCLink
+    _MININET_AVAILABLE = True
+except ImportError:
+    print("[INFO] Mininet not found — using built-in topology fallback.")
+    print("[INFO] On Linux, install Mininet for full topology support:")
+    print("       sudo apt install python3-mininet")
+
+
+if _MININET_AVAILABLE:
+    # Full Mininet Topo class with TCLink bandwidth/delay config
+    class TCPBottleneckTopo(_MininetTopo):
+        """
+        Bottleneck network topology defined using Mininet's Topo API.
+
+        Layout:
+            sender ---[10 Mbps, 5 ms]--- router ---[1.5 Mbps, 20 ms]--- receiver
+
+        The Router-to-Receiver link is the bottleneck (lower bandwidth,
+        higher delay).  Link parameters are stored as class attributes so
+        the discrete-event simulation can read them directly.
+        """
+
+        SENDER_ROUTER_BW_Mbps = 10
+        SENDER_ROUTER_DELAY_MS = 5
+        ROUTER_RECEIVER_BW_Mbps = 1.5
+        ROUTER_RECEIVER_DELAY_MS = 20
+        PACKET_SIZE_BYTES = 1500
+        ROUTER_QUEUE_PKTS = 20
+
+        def build(self):
+            sender = self.addHost('sender')
+            receiver = self.addHost('receiver')
+            router = self.addSwitch('router')
+            self.addLink(
+                sender, router, cls=_TCLink,
+                bw=self.SENDER_ROUTER_BW_Mbps,
+                delay=f'{self.SENDER_ROUTER_DELAY_MS}ms',
+            )
+            self.addLink(
+                router, receiver, cls=_TCLink,
+                bw=self.ROUTER_RECEIVER_BW_Mbps,
+                delay=f'{self.ROUTER_RECEIVER_DELAY_MS}ms',
+            )
+            return sender, router, receiver
+else:
+    # Fallback topology class (mirrors Mininet Topo API, works on any OS)
+    class TCPBottleneckTopo:
+        """
+        Bottleneck network topology (Mininet-compatible fallback).
+
+        When Mininet is not installed (e.g. on Windows), this class provides
+        the same topology definition and link parameters.  On Linux with
+        Mininet installed, the full Mininet Topo subclass is used instead.
+
+        Layout:
+            sender ---[10 Mbps, 5 ms]--- router ---[1.5 Mbps, 20 ms]--- receiver
+        """
+
+        SENDER_ROUTER_BW_Mbps = 10
+        SENDER_ROUTER_DELAY_MS = 5
+        ROUTER_RECEIVER_BW_Mbps = 1.5
+        ROUTER_RECEIVER_DELAY_MS = 20
+        PACKET_SIZE_BYTES = 1500
+        ROUTER_QUEUE_PKTS = 20
+
+        def __init__(self):
+            self._hosts = []
+            self._switches = []
+            self._links = []
+
+        def addHost(self, name):
+            self._hosts.append(name)
+            return name
+
+        def addSwitch(self, name):
+            self._switches.append(name)
+            return name
+
+        def addLink(self, node1, node2, **kwargs):
+            self._links.append((node1, node2, kwargs))
+            return (node1, node2)
+
+        def build(self):
+            sender = self.addHost('sender')
+            receiver = self.addHost('receiver')
+            router = self.addSwitch('router')
+            self.addLink(sender, router, bw=self.SENDER_ROUTER_BW_Mbps,
+                         delay=f'{self.SENDER_ROUTER_DELAY_MS}ms')
+            self.addLink(router, receiver, bw=self.ROUTER_RECEIVER_BW_Mbps,
+                         delay=f'{self.ROUTER_RECEIVER_DELAY_MS}ms')
+            return sender, router, receiver
+
+
+# Build the topology once — parameters below are derived from it
+_topo = TCPBottleneckTopo()
+
+# =============================================================================
+# Network Parameters (sourced from Mininet topology)
+# =============================================================================
+SENDER_TO_ROUTER_BW = _topo.SENDER_ROUTER_BW_Mbps * 1e6      # 10 Mbps
+ROUTER_TO_RECEIVER_BW = _topo.ROUTER_RECEIVER_BW_Mbps * 1e6   # 1.5 Mbps
+SENDER_TO_ROUTER_DELAY = _topo.SENDER_ROUTER_DELAY_MS / 1000  # 0.005 s
+ROUTER_TO_RECEIVER_DELAY = _topo.ROUTER_RECEIVER_DELAY_MS / 1000  # 0.02 s
+PACKET_SIZE = _topo.PACKET_SIZE_BYTES                         # 1500 bytes
+ROUTER_QUEUE_SIZE = _topo.ROUTER_QUEUE_PKTS                   # 20 packets
+
+# Derived constants
+ONE_WAY_DELAY = SENDER_TO_ROUTER_DELAY + ROUTER_TO_RECEIVER_DELAY
+BASE_RTT = 2 * ONE_WAY_DELAY  # 50 ms
+BOTTLENECK_BDP = max(int(ROUTER_TO_RECEIVER_BW * BASE_RTT / (PACKET_SIZE * 8)), 1)
+
+# Simulation control
+TOTAL_ACK_EVENTS = 6000
+INITIAL_CWND = 1.0
+INITIAL_SSTHRESH = 64.0
+# Loss begins when cwnd exceeds BDP + router queue capacity (queue overflow)
+LOSS_THRESHOLD_CWND = BOTTLENECK_BDP + ROUTER_QUEUE_SIZE  # 6 + 20 = 26 packets
+BASE_LOSS_PROB = 0.04
+MIN_RTO = 0.2  # Minimum RTO in seconds (per RFC 6298)
+SEED = 42
 
 # =============================================================================
 # Font Configuration (cross-platform)
@@ -39,32 +172,7 @@ if _os == 'Linux':
     if os.path.isfile(_dejavu):
         fm.fontManager.addfont(_dejavu)
         plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
-# On Windows/macOS, matplotlib uses its own bundled fonts — no manual setup needed
 plt.rcParams['axes.unicode_minus'] = False
-
-# =============================================================================
-# Network Parameters
-# =============================================================================
-SENDER_TO_ROUTER_BW = 10e6      # 10 Mbps
-ROUTER_TO_RECEIVER_BW = 1.5e6   # 1.5 Mbps (bottleneck)
-SENDER_TO_ROUTER_DELAY = 0.005  # 5 ms
-ROUTER_TO_RECEIVER_DELAY = 0.02 # 20 ms
-PACKET_SIZE = 1500              # bytes
-ROUTER_QUEUE_SIZE = 20          # packets
-
-# Derived
-ONE_WAY_DELAY = SENDER_TO_ROUTER_DELAY + ROUTER_TO_RECEIVER_DELAY
-BASE_RTT = 2 * ONE_WAY_DELAY  # 50 ms
-BOTTLENECK_BDP = max(int(ROUTER_TO_RECEIVER_BW * BASE_RTT / (PACKET_SIZE * 8)), 1)
-
-# Simulation
-TOTAL_ACK_EVENTS = 6000  # Total ACK events to simulate
-INITIAL_CWND = 1.0
-INITIAL_SSTHRESH = 64.0
-# Loss begins when cwnd exceeds BDP + router queue capacity (queue overflow)
-LOSS_THRESHOLD_CWND = BOTTLENECK_BDP + ROUTER_QUEUE_SIZE  # 6 + 20 = 26 packets
-BASE_LOSS_PROB = 0.04  # Base probability of loss per ACK when cwnd > threshold
-SEED = 42
 
 
 # =============================================================================
@@ -78,6 +186,7 @@ def simulate_tahoe(seed=SEED):
     - Slow Start: cwnd += 1 per ACK (exponential growth) while cwnd < ssthresh
     - Congestion Avoidance: cwnd += 1/cwnd per ACK (linear) while cwnd >= ssthresh
     - On 3 duplicate ACKs: ssthresh = cwnd/2, cwnd = 1 (reset to slow start)
+    - On RTO timeout:      ssthresh = cwnd/2, cwnd = 1 (reset to slow start)
     """
     rng = random.Random(seed)
 
@@ -86,18 +195,31 @@ def simulate_tahoe(seed=SEED):
     dup_ack_count = 0
     total_dropped = 0
     total_acked = 0
+    timeout_count = 0
 
     time_log, cwnd_log, rtt_log, drop_log, throughput_log = [], [], [], [], []
     bytes_sent = 0.0
     current_time = 0.0
     srtt = BASE_RTT
     rttvar = BASE_RTT / 2
+    last_new_ack_time = 0.0
 
     for ack_event in range(TOTAL_ACK_EVENTS):
+        # --- RTO Timeout check (per RFC 6298) ---
+        # Fires when no new ACK has been received for RTO duration.
+        # RTO = SRTT + 4 * RTTVAR, with a floor of MIN_RTO.
+        if current_time > BASE_RTT:
+            rto = srtt + 4.0 * rttvar
+            rto = max(rto, MIN_RTO)
+            if current_time - last_new_ack_time > rto:
+                # Timeout: same response as 3-dup-ACK for Tahoe
+                ssthresh = max(cwnd / 2.0, 2.0)
+                cwnd = 1.0
+                dup_ack_count = 0
+                last_new_ack_time = current_time  # restart timer
+                timeout_count += 1
+
         # --- Determine if this ACK is a duplicate or new ---
-        # Loss probability increases with cwnd beyond threshold.
-        # When congestion occurs, losses happen in bursts (queue overflow
-        # drops multiple packets), so we model burst loss probability.
         if cwnd > LOSS_THRESHOLD_CWND:
             excess = (cwnd - LOSS_THRESHOLD_CWND) / LOSS_THRESHOLD_CWND
             loss_prob = BASE_LOSS_PROB * (1 + 2.0 * excess)
@@ -115,12 +237,13 @@ def simulate_tahoe(seed=SEED):
                 ssthresh = max(cwnd / 2.0, 2.0)
                 cwnd = 1.0
                 dup_ack_count = 0
+                last_new_ack_time = current_time  # restart timer after retransmit
         else:
-            # New ACK received — decay dup counter (don't hard-reset to 0
-            # because in real TCP, out-of-order arrivals sustain dup ACKs)
+            # New ACK received — decay dup counter
             dup_ack_count = max(0, dup_ack_count - 1)
             total_acked += 1
             bytes_sent += PACKET_SIZE
+            last_new_ack_time = current_time  # new ACK restarts timer
 
             # Congestion window update
             if cwnd < ssthresh:
@@ -129,7 +252,6 @@ def simulate_tahoe(seed=SEED):
                 cwnd += 1.0 / cwnd  # Congestion Avoidance: linear
 
         # --- Calculate RTT ---
-        # RTT increases with queue depth (proportional to cwnd beyond BDP)
         queue_depth = max(0, cwnd - BOTTLENECK_BDP)
         queuing_delay = (queue_depth * PACKET_SIZE * 8 / ROUTER_TO_RECEIVER_BW)
         queuing_delay = min(queuing_delay, 0.4)
@@ -144,7 +266,7 @@ def simulate_tahoe(seed=SEED):
         srtt = (1 - alpha) * srtt + alpha * measured_rtt
 
         # Time advancement: each ACK represents a fraction of an RTT
-        min_spacing = (PACKET_SIZE * 8) / ROUTER_TO_RECEIVER_BW  # bottleneck transmission time per packet
+        min_spacing = (PACKET_SIZE * 8) / ROUTER_TO_RECEIVER_BW
         ack_spacing = max(srtt / max(cwnd, 1), min_spacing)
         current_time += ack_spacing
 
@@ -162,6 +284,7 @@ def simulate_tahoe(seed=SEED):
         'drop_rate': drop_log, 'throughput': throughput_log,
         'total_dropped': total_dropped, 'total_sent': total_dropped + total_acked,
         'total_acked': total_acked, 'bytes_transmitted': bytes_sent,
+        'timeouts': timeout_count,
     }
 
 
@@ -178,6 +301,7 @@ def simulate_reno(seed=SEED):
     - On 3 duplicate ACKs: ssthresh = cwnd/2, cwnd = ssthresh + 3 (fast recovery)
       - During fast recovery: cwnd += 1 per additional dup ACK
       - On new ACK exiting recovery: cwnd = ssthresh (enter congestion avoidance)
+    - On RTO timeout: ssthresh = cwnd/2, cwnd = 1 (fall back to Tahoe behavior)
     """
     rng = random.Random(seed + 1000)
 
@@ -187,17 +311,30 @@ def simulate_reno(seed=SEED):
     in_fast_recovery = False
     total_dropped = 0
     total_acked = 0
+    timeout_count = 0
 
     time_log, cwnd_log, rtt_log, drop_log, throughput_log = [], [], [], [], []
     bytes_sent = 0.0
     current_time = 0.0
     srtt = BASE_RTT
     rttvar = BASE_RTT / 2
+    last_new_ack_time = 0.0
 
     for ack_event in range(TOTAL_ACK_EVENTS):
-        # Loss probability (same model as Tahoe for fair comparison)
-        # Burst loss model: when congestion occurs, multiple packets drop
-        # in sequence, generating dup ACKs without full counter reset.
+        # --- RTO Timeout check (per RFC 6298) ---
+        # Timeout cancels any ongoing Fast Recovery and resets to Slow Start.
+        if current_time > BASE_RTT:
+            rto = srtt + 4.0 * rttvar
+            rto = max(rto, MIN_RTO)
+            if current_time - last_new_ack_time > rto:
+                ssthresh = max(cwnd / 2.0, 2.0)
+                cwnd = 1.0
+                dup_ack_count = 0
+                in_fast_recovery = False  # cancel fast recovery
+                last_new_ack_time = current_time
+                timeout_count += 1
+
+        # --- Loss probability (same model as Tahoe for fair comparison) ---
         if cwnd > LOSS_THRESHOLD_CWND:
             excess = (cwnd - LOSS_THRESHOLD_CWND) / LOSS_THRESHOLD_CWND
             loss_prob = BASE_LOSS_PROB * (1 + 2.0 * excess)
@@ -214,12 +351,12 @@ def simulate_reno(seed=SEED):
                 total_dropped += 1
             else:
                 # New ACK: exit fast recovery -> congestion avoidance
-                cwnd = ssthresh  # Reno sets cwnd to ssthresh, NOT 1
+                cwnd = ssthresh
                 in_fast_recovery = False
                 dup_ack_count = 0
                 total_acked += 1
                 bytes_sent += PACKET_SIZE
-                # Continue in congestion avoidance (cwnd += 1/cwnd below)
+                last_new_ack_time = current_time  # new ACK restarts timer
                 if cwnd >= ssthresh:
                     cwnd += 1.0 / cwnd
         else:
@@ -229,18 +366,19 @@ def simulate_reno(seed=SEED):
 
                 if dup_ack_count == 3:
                     # Reno: triple-dup-ACK -> fast recovery
-                    # ssthresh = cwnd/2, cwnd = ssthresh + 3
                     ssthresh = max(cwnd / 2.0, 2.0)
                     cwnd = ssthresh + 3.0
                     in_fast_recovery = True
-                    dup_ack_count = 0  # Reset for recovery phase
+                    dup_ack_count = 0
+                    last_new_ack_time = current_time  # restart timer
             else:
-                # Decay dup counter (same as Tahoe: don't hard-reset)
+                # Decay dup counter
                 dup_ack_count = max(0, dup_ack_count - 1)
                 total_acked += 1
                 bytes_sent += PACKET_SIZE
+                last_new_ack_time = current_time  # new ACK restarts timer
 
-                # Congestion window update (same as Tahoe)
+                # Congestion window update
                 if cwnd < ssthresh:
                     cwnd += 1.0
                 else:
@@ -259,7 +397,7 @@ def simulate_reno(seed=SEED):
         rttvar = (1 - beta) * rttvar + beta * abs(srtt - measured_rtt)
         srtt = (1 - alpha) * srtt + alpha * measured_rtt
 
-        min_spacing = (PACKET_SIZE * 8) / ROUTER_TO_RECEIVER_BW  # bottleneck transmission time per packet
+        min_spacing = (PACKET_SIZE * 8) / ROUTER_TO_RECEIVER_BW
         ack_spacing = max(srtt / max(cwnd, 1), min_spacing)
         current_time += ack_spacing
 
@@ -277,6 +415,7 @@ def simulate_reno(seed=SEED):
         'drop_rate': drop_log, 'throughput': throughput_log,
         'total_dropped': total_dropped, 'total_sent': total_dropped + total_acked,
         'total_acked': total_acked, 'bytes_transmitted': bytes_sent,
+        'timeouts': timeout_count,
     }
 
 
@@ -300,7 +439,7 @@ def run_multi_sim(sim_func, num_runs=5, seed_base=42):
             averaged[key].append(np.mean(vals))
         averaged['time'].append(all_results[0]['time'][j])
 
-    for key in ['total_dropped', 'total_sent', 'total_acked', 'bytes_transmitted']:
+    for key in ['total_dropped', 'total_sent', 'total_acked', 'bytes_transmitted', 'timeouts']:
         averaged[key] = sum(r[key] for r in all_results)
 
     return averaged
@@ -319,9 +458,9 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
     print("\nGenerating comparison graphs...")
 
     # ---- Shared style constants ----
-    TAHOE_COLOR = '#1565C0'   # Material Blue 800
-    RENO_COLOR  = '#C62828'   # Material Red 800
-    REF_COLOR   = '#9E9E9E'   # Grey 500 for reference lines
+    TAHOE_COLOR = '#1565C0'
+    RENO_COLOR  = '#C62828'
+    REF_COLOR   = '#9E9E9E'
     BG_COLOR    = '#FAFAFA'
     GRID_COLOR  = '#E0E0E0'
     LABEL_SIZE  = 11
@@ -331,7 +470,6 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
     bottleneck_kbps = ROUTER_TO_RECEIVER_BW / 1000
 
     def _style_ax(ax, xlabel, ylabel, title):
-        """Apply consistent styling to a single axes."""
         ax.set_facecolor(BG_COLOR)
         ax.set_xlabel(xlabel, fontsize=LABEL_SIZE, labelpad=8)
         ax.set_ylabel(ylabel, fontsize=LABEL_SIZE, labelpad=8)
@@ -344,7 +482,6 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
         ax.spines['bottom'].set_color('#BDBDBD')
 
     def _clean_legend(ax, loc='upper right'):
-        """Legend with no border, rounded background, placed outside data area."""
         leg = ax.legend(loc=loc, fontsize=9, frameon=True,
                         fancybox=True, framealpha=0.92,
                         edgecolor='#CCCCCC', borderpad=0.8,
@@ -353,7 +490,7 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
         return leg
 
     # =================================================================
-    # Graph 1: Congestion Window (single run — preserves sharp cwnd=1 resets)
+    # Graph 1: Congestion Window (single run)
     # =================================================================
     fig, ax = plt.subplots(figsize=(11, 5.2))
     fig.patch.set_facecolor('white')
@@ -363,7 +500,6 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
     ax.plot(reno_single['time'], reno_single['cwnd'],
             color=RENO_COLOR, linewidth=1.3, label='TCP Reno', zorder=3)
 
-    # Reference line: BDP
     ax.axhline(y=BOTTLENECK_BDP, color=REF_COLOR, linestyle='--',
                linewidth=1.0, alpha=0.7, zorder=1)
     ax.text(0.98, 0.05, f'BDP = {BOTTLENECK_BDP} pkts', transform=ax.transAxes,
@@ -381,7 +517,7 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
     print("  Saved: cwnd_comparison.png")
 
     # =================================================================
-    # Graph 2: RTT (single run — preserves sharp sawtooth correlation with cwnd)
+    # Graph 2: RTT (single run)
     # =================================================================
     fig, ax = plt.subplots(figsize=(11, 5.2))
     fig.patch.set_facecolor('white')
@@ -391,10 +527,8 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
     ax.plot(reno_single['time'], reno_single['rtt'],
             color=RENO_COLOR, linewidth=1.2, label='TCP Reno', zorder=3)
 
-    # Reference line: Base RTT
     ax.axhline(y=BASE_RTT * 1000, color=REF_COLOR, linestyle='--',
                linewidth=1.0, alpha=0.7, zorder=1)
-    # Place annotation in lower-right corner (empty space, data lines are ~440ms)
     ax.text(0.98, 0.05, f'Base RTT = {BASE_RTT*1000:.0f} ms',
             transform=ax.transAxes,
             fontsize=8.5, color='#757575', ha='right', va='bottom', style='italic')
@@ -410,7 +544,7 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
     print("  Saved: rtt_comparison.png")
 
     # =================================================================
-    # Graph 3: Drop Rate (5-run average — smoothing is fine for cumulative metrics)
+    # Graph 3: Drop Rate (5-run average)
     # =================================================================
     fig, ax = plt.subplots(figsize=(11, 5.2))
     fig.patch.set_facecolor('white')
@@ -442,7 +576,6 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
     ax.plot(reno_avg['time'], reno_avg['throughput'],
             color=RENO_COLOR, linewidth=1.4, label='TCP Reno', zorder=3)
 
-    # Reference line: Bottleneck capacity
     ax.axhline(y=bottleneck_kbps, color=REF_COLOR, linestyle='--',
                linewidth=1.0, alpha=0.7, zorder=1)
     ax.text(0.98, 0.05, f'Bottleneck = {bottleneck_kbps:.0f} kbps',
@@ -528,6 +661,84 @@ def generate_graphs(tahoe_single, reno_single, tahoe_avg, reno_avg, output_dir):
 
 
 # =============================================================================
+# CSV Export
+# =============================================================================
+def save_csv_files(tahoe_single, reno_single, tahoe_avg, reno_avg,
+                   tahoe_stats, reno_stats, output_dir):
+    """Save simulation data to CSV files for reproducibility and analysis.
+
+    Creates 5 CSV files in output_dir:
+      - cwnd_data.csv        : single-run congestion window (ACK-level)
+      - rtt_data.csv         : single-run round-trip time (ACK-level)
+      - throughput_data.csv  : 5-run averaged throughput (ACK-level)
+      - drop_rate_data.csv   : 5-run averaged packet drop rate (ACK-level)
+      - summary_results.csv  : final aggregated statistics table
+    """
+    csv_dir = os.path.join(output_dir, 'csv')
+    os.makedirs(csv_dir, exist_ok=True)
+
+    # ---- 1. Congestion Window (single run) ----
+    path = os.path.join(csv_dir, 'cwnd_data.csv')
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ACK_Event', 'Tahoe_cwnd_pkts', 'Reno_cwnd_pkts'])
+        for i in range(len(tahoe_single['cwnd'])):
+            w.writerow([i + 1,
+                        round(tahoe_single['cwnd'][i], 4),
+                        round(reno_single['cwnd'][i], 4)])
+    print(f"  Saved: csv/cwnd_data.csv  ({len(tahoe_single['cwnd'])} rows)")
+
+    # ---- 2. Round-Trip Time (single run) ----
+    path = os.path.join(csv_dir, 'rtt_data.csv')
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ACK_Event', 'Tahoe_RTT_ms', 'Reno_RTT_ms'])
+        for i in range(len(tahoe_single['rtt'])):
+            w.writerow([i + 1,
+                        round(tahoe_single['rtt'][i], 4),
+                        round(reno_single['rtt'][i], 4)])
+    print(f"  Saved: csv/rtt_data.csv  ({len(tahoe_single['rtt'])} rows)")
+
+    # ---- 3. Throughput (5-run average) ----
+    path = os.path.join(csv_dir, 'throughput_data.csv')
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ACK_Event', 'Time_s',
+                     'Tahoe_Throughput_kbps', 'Reno_Throughput_kbps'])
+        for i in range(len(tahoe_avg['throughput'])):
+            w.writerow([i + 1,
+                        round(tahoe_avg['time'][i], 6),
+                        round(tahoe_avg['throughput'][i], 4),
+                        round(reno_avg['throughput'][i], 4)])
+    print(f"  Saved: csv/throughput_data.csv  ({len(tahoe_avg['throughput'])} rows)")
+
+    # ---- 4. Drop Rate (5-run average) ----
+    path = os.path.join(csv_dir, 'drop_rate_data.csv')
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['ACK_Event', 'Time_s',
+                     'Tahoe_DropRate_pct', 'Reno_DropRate_pct'])
+        for i in range(len(tahoe_avg['drop_rate'])):
+            w.writerow([i + 1,
+                        round(tahoe_avg['time'][i], 6),
+                        round(tahoe_avg['drop_rate'][i], 4),
+                        round(reno_avg['drop_rate'][i], 4)])
+    print(f"  Saved: csv/drop_rate_data.csv  ({len(tahoe_avg['drop_rate'])} rows)")
+
+    # ---- 5. Summary Results ----
+    path = os.path.join(csv_dir, 'summary_results.csv')
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['Metric', 'TCP Tahoe', 'TCP Reno'])
+        for key in tahoe_stats:
+            if key != 'Algorithm':
+                w.writerow([key, tahoe_stats[key], reno_stats[key]])
+    print(f"  Saved: csv/summary_results.csv")
+
+    print(f"  All CSV files saved to: {csv_dir}/")
+
+
+# =============================================================================
 # Statistics
 # =============================================================================
 def compute_stats(data, label):
@@ -547,6 +758,7 @@ def compute_stats(data, label):
         'Total Packets Sent': str(data['total_sent']),
         'Total Packets Dropped': str(data['total_dropped']),
         'Total Packets ACKed': str(data['total_acked']),
+        'RTO Timeouts': str(data.get('timeouts', 0)),
     }
 
 
@@ -556,16 +768,19 @@ def compute_stats(data, label):
 def main():
     print("=" * 65)
     print("  TCP Congestion Control Simulation: Tahoe vs Reno")
+    print("  (Mininet topology + discrete-event simulation)")
     print("=" * 65)
-    print(f"\n  Network Parameters:")
-    print(f"    Sender->Router:     {SENDER_TO_ROUTER_BW/1e6:.1f} Mbps, "
-          f"{SENDER_TO_ROUTER_DELAY*1000:.0f} ms delay")
-    print(f"    Router->Receiver:   {ROUTER_TO_RECEIVER_BW/1e6:.1f} Mbps, "
-          f"{ROUTER_TO_RECEIVER_DELAY*1000:.0f} ms delay (bottleneck)")
+    print(f"\n  Mininet Topology: {_topo.__class__.__name__}")
+    print(f"    Sender->Router:     {_topo.SENDER_ROUTER_BW_Mbps:.1f} Mbps, "
+          f"{_topo.SENDER_ROUTER_DELAY_MS:.0f} ms delay")
+    print(f"    Router->Receiver:   {_topo.ROUTER_RECEIVER_BW_Mbps:.1f} Mbps, "
+          f"{_topo.ROUTER_RECEIVER_DELAY_MS:.0f} ms delay (bottleneck)")
     print(f"    Packet Size:        {PACKET_SIZE} bytes")
     print(f"    Router Queue:       {ROUTER_QUEUE_SIZE} packets")
     print(f"    Base RTT:           {BASE_RTT*1000:.0f} ms")
     print(f"    BDP:                {BOTTLENECK_BDP} packets")
+    print(f"    Loss Threshold:     {LOSS_THRESHOLD_CWND} packets")
+    print(f"    Min RTO:            {MIN_RTO*1000:.0f} ms")
     print(f"    Total ACK Events:   {TOTAL_ACK_EVENTS}")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -585,7 +800,6 @@ def main():
     print(f"\n{'─'*65}")
     print("  Phase 3: Generating Comparison Graphs")
     print(f"{'─'*65}")
-    # Single-run data for cwnd/RTT plots (preserves sharp sawtooth patterns)
     tahoe_single = simulate_tahoe(seed=42)
     reno_single = simulate_reno(seed=1042)
     generate_graphs(tahoe_single, reno_single, tahoe_data, reno_data, output_dir)
@@ -602,19 +816,28 @@ def main():
         if key != 'Algorithm':
             print(f"  {key:<28} {tahoe_stats[key]:>15} {reno_stats[key]:>15}")
 
+    print(f"\n{'─'*65}")
+    print("  Phase 5: Exporting CSV Data Files")
+    print(f"{'─'*65}")
+    save_csv_files(tahoe_single, reno_single, tahoe_data, reno_data,
+                   tahoe_stats, reno_stats, output_dir)
+
     # Save stats JSON
     stats_output = {
         'tahoe': tahoe_stats,
         'reno': reno_stats,
         'network_params': {
-            'sender_to_router_bw_mbps': SENDER_TO_ROUTER_BW / 1e6,
-            'router_to_receiver_bw_mbps': ROUTER_TO_RECEIVER_BW / 1e6,
-            'sender_to_router_delay_ms': SENDER_TO_ROUTER_DELAY * 1000,
-            'router_to_receiver_delay_ms': ROUTER_TO_RECEIVER_DELAY * 1000,
+            'topology_class': _topo.__class__.__name__,
+            'sender_to_router_bw_mbps': _topo.SENDER_ROUTER_BW_Mbps,
+            'router_to_receiver_bw_mbps': _topo.ROUTER_RECEIVER_BW_Mbps,
+            'sender_to_router_delay_ms': _topo.SENDER_ROUTER_DELAY_MS,
+            'router_to_receiver_delay_ms': _topo.ROUTER_RECEIVER_DELAY_MS,
             'packet_size_bytes': PACKET_SIZE,
             'router_queue_size': ROUTER_QUEUE_SIZE,
             'base_rtt_ms': BASE_RTT * 1000,
             'bdp_packets': BOTTLENECK_BDP,
+            'loss_threshold_cwnd': LOSS_THRESHOLD_CWND,
+            'min_rto_ms': MIN_RTO * 1000,
             'total_ack_events': TOTAL_ACK_EVENTS,
         }
     }
@@ -623,7 +846,7 @@ def main():
         json.dump(stats_output, f, indent=2)
     print(f"\n  Statistics saved to: {stats_path}")
     print(f"\n{'='*65}")
-    print("  Simulation Complete! Graphs saved to: {output_dir}/")
+    print(f"  Simulation Complete! Graphs saved to: {output_dir}/")
     print(f"{'='*65}")
 
 

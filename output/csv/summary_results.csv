@@ -1,0 +1,15 @@
+Metric,TCP Tahoe,TCP Reno
+Avg cwnd (pkts),40.06,40.78
+Max cwnd (pkts),64.2,55.9
+Min cwnd (pkts),2.0,2.0
+Std cwnd,5.35,4.32
+Avg RTT (ms),318.9,326.8
+Max RTT (ms),452.4,399.8
+Avg Drop Rate (%),8.12,8.28
+Overall Drop Rate (%),7.94,8.53
+Avg Throughput (kbps),1215.6,1356.0
+Max Throughput (kbps),1337.6,1368.5
+Total Packets Sent,30000,30000
+Total Packets Dropped,2383,2559
+Total Packets ACKed,27617,27441
+RTO Timeouts,0,0

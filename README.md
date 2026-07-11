@@ -76,8 +76,32 @@ python tcp_simulation.py
 
 Output graphs and statistics are saved in the `output/` directory. Works on Windows, macOS, and Linux.
 
+## Folder Structure
+
+```
+CN-TahoeReno/
+├── code/
+│   ├── tcp_simulation.py        # Main simulation script (run this)
+│   └── README.md                # Project documentation
+├── output/
+│   ├── cwnd_comparison.png      # Congestion window graph (single run)
+│   ├── rtt_comparison.png       # Round-trip time graph (single run)
+│   ├── drop_rate_comparison.png # Packet drop rate graph (5-run average)
+│   ├── throughput_comparison.png# Throughput graph (5-run average)
+│   ├── summary_dashboard.png    # All 4 metrics combined dashboard
+│   ├── simulation_stats.json    # Full results in JSON format
+│   └── csv/
+│       ├── cwnd_data.csv        # Congestion window per ACK event
+│       ├── rtt_data.csv         # RTT per ACK event
+│       ├── throughput_data.csv  # Throughput per ACK event (5-run avg)
+│       ├── drop_rate_data.csv   # Drop rate per ACK event (5-run avg)
+│       └── summary_results.csv  # Final stats table (Tahoe vs Reno)
+├── report.docx                  # Technical report
+└── report.pdf                   # Technical report (PDF)
+```
+
 ## Author
 
-| Name |
-|------|
-| Ghania Jawed |
+**Ghania Jawed**
+
+This is my 6th semester project for the Computer Networks course.

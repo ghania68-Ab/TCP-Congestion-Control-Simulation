@@ -13,7 +13,8 @@
     "Max Throughput (kbps)": "1337.6",
     "Total Packets Sent": "30000",
     "Total Packets Dropped": "2383",
-    "Total Packets ACKed": "27617"
+    "Total Packets ACKed": "27617",
+    "RTO Timeouts": "0"
   },
   "reno": {
     "Algorithm": "TCP Reno",
@@ -29,17 +30,21 @@
     "Max Throughput (kbps)": "1368.5",
     "Total Packets Sent": "30000",
     "Total Packets Dropped": "2559",
-    "Total Packets ACKed": "27441"
+    "Total Packets ACKed": "27441",
+    "RTO Timeouts": "0"
   },
   "network_params": {
-    "sender_to_router_bw_mbps": 10.0,
+    "topology_class": "TCPBottleneckTopo",
+    "sender_to_router_bw_mbps": 10,
     "router_to_receiver_bw_mbps": 1.5,
-    "sender_to_router_delay_ms": 5.0,
-    "router_to_receiver_delay_ms": 20.0,
+    "sender_to_router_delay_ms": 5,
+    "router_to_receiver_delay_ms": 20,
     "packet_size_bytes": 1500,
     "router_queue_size": 20,
     "base_rtt_ms": 50.0,
     "bdp_packets": 6,
+    "loss_threshold_cwnd": 26,
+    "min_rto_ms": 200.0,
     "total_ack_events": 6000
   }
 }
