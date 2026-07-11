@@ -96,7 +96,6 @@ CN-TahoeReno/
 │       ├── throughput_data.csv  # Throughput per ACK event (5-run avg)
 │       ├── drop_rate_data.csv   # Drop rate per ACK event (5-run avg)
 │       └── summary_results.csv  # Final stats table (Tahoe vs Reno)
-├── report.docx                  # Technical report
 └── report.pdf                   # Technical report (PDF)
 ```
 
